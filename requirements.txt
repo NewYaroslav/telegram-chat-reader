@@ -1,0 +1,6 @@
+telethon==1.37.0
+python-dotenv==1.0.1
+colorlog==6.9.0
+rich==13.9.4
+asyncio==3.4.3
+logging==0.4.9.6
