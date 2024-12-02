@@ -271,6 +271,58 @@ async def test_send_message(client, chat_id: str, message_text: str) -> bool:
     else:
         console.print("[bold yellow]Message sending failed.[/bold yellow]")
         
+async def fetch_chat_history(client, chat_id, output_file="chat_history.json", topic_id=None, limit=100):
+    """
+    Скачивает историю сообщений из указанного чата или топика форума.
+
+    :param client: TelegramClient, авторизованный клиент.
+    :param chat_id: ID чата или username.
+    :param output_file: Имя файла для сохранения истории (по умолчанию "chat_history.json").
+    :param topic_id: ID топика форума (если указан, загружаются сообщения только из этого топика).
+    :param limit: Максимальное количество сообщений для загрузки (по умолчанию 100).
+    """
+    try:
+        logger.info(f"Fetching history for chat ID {chat_id} with topic ID {topic_id}...")
+
+        # Преобразуем chat_id в int, если это строка
+        if isinstance(chat_id, str):
+            chat_id = int(chat_id)
+
+        # Получаем Entity чата
+        entity = await client.get_entity(chat_id)
+        logger.info(f"Entity fetched: {entity.title if hasattr(entity, 'title') else entity.id}")
+
+        # Настраиваем фильтр для топика
+        # filter_params = {"thread_id": topic_id} if topic_id else {}
+
+        # Итерируем сообщения
+        messages = []
+        async for message in client.iter_messages(entity, limit=limit, reply_to=topic_id):
+            messages.append({
+                "id": message.id,
+                "date": message.date.isoformat(),
+                "text": message.text or "",
+                "sender_id": message.sender_id,
+                "reply_to": message.reply_to.reply_to_msg_id if message.reply_to else None,
+            })
+
+        # Сохраняем историю сообщений в файл
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(messages, f, ensure_ascii=False, indent=4)
+        logger.info(f"Chat history saved to {output_file}")
+
+        console.print(f"[bold green]Chat history successfully saved to {output_file}[/bold green]")
+
+    except errors.FloodWaitError as e:
+        logger.warning(f"Rate limit exceeded. Waiting for {e.seconds} seconds...")
+        await asyncio.sleep(e.seconds)
+    except ValueError as e:
+        logger.error(f"Chat {chat_id} not found: {e}")
+    except errors.RPCError as e:
+        logger.error(f"Telegram API error while fetching history: {e}")
+    except Exception as e:
+        logger.critical(f"Unexpected error while fetching history: {e}")
+        
 async def main():
     # Выполняем асинхронную авторизацию
     client = await manual_authorization()
@@ -283,7 +335,8 @@ async def main():
         console.print("[bold cyan]Choose an action:[/bold cyan]")
         console.print("[1] Send a message")
         console.print("[2] Load and display chat list")
-        console.print("[3] Exit")
+        console.print("[3] Fetch chat history")
+        console.print("[4] Exit")
         
         choice = input("Enter your choice: ").strip()
         
@@ -295,6 +348,14 @@ async def main():
             # Сохранение чатов в файл
             await save_all_chats(client, output_file="all_chats.json")
         elif choice == "3":
+            # Запрос данных для загрузки истории
+            chat_id = input("Enter the chat ID or username: ").strip()
+            topic_id_input = input("Enter the topic ID (optional, press Enter to skip): ").strip()
+            topic_id = int(topic_id_input) if topic_id_input else None
+            output_file = input("Enter the output file name (default: chat_history.json): ").strip() or "chat_history.json"
+            limit = int(input("Enter the number of messages to fetch (default: 100): ").strip() or 100)
+            await fetch_chat_history(client, chat_id, output_file, topic_id, limit)
+        elif choice == "4":
             console.print("[bold green]Exiting program. Goodbye![/bold green]")
             # Завершаем соединение
             await client.disconnect()
