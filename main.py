@@ -1,9 +1,10 @@
-from telethon import TelegramClient, errors
-from telethon.tl.types import InputMessagesFilterPinned
-from telethon.tl.functions.channels import GetForumTopicsRequest
+from telethon import TelegramClient, errors, events
+from telethon.tl.types import InputMessagesFilterPinned # Для фильтрации закрепленных сообщений
+from telethon.tl.functions.channels import GetForumTopicsRequest  # Для получения списка тем форума
 import asyncio
 from asyncio.exceptions import TimeoutError
-from dotenv import load_dotenv
+from dotenv import load_dotenv # Для загрузки конфигурации из .env
+from datetime import datetime
 import json
 import logging
 import colorlog
@@ -356,8 +357,173 @@ async def fetch_chat_history(client, chat_id, output_file="chat_history.json", t
     except Exception as e:
         logger.critical(f"Unexpected error while fetching history: {e}")
         
+async def save_event_to_file(event, file_name="event_debug.jsonl"):
+    """
+    Преобразует событие в сериализуемую структуру и сохраняет его в JSON-файл.
+
+    :param event: Событие, которое нужно преобразовать.
+    :param file_name: Имя файла для записи (по умолчанию "event_debug.jsonl").
+    """
+    try:
+        # Преобразуем событие в словарь
+        event_dict = event.to_dict()
+
+        # Рекурсивно обрабатываем словарь, конвертируя datetime в строку
+        def convert_to_serializable(obj):
+            if isinstance(obj, dict):
+                return {key: convert_to_serializable(value) for key, value in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_serializable(item) for item in obj]
+            elif isinstance(obj, datetime):
+                return obj.isoformat()  # Преобразуем datetime в строку
+            elif hasattr(obj, "to_dict"):
+                return convert_to_serializable(obj.to_dict())  # Рекурсивно обрабатываем вложенные объекты
+            return obj  # Для всех других типов возвращаем как есть
+
+        serializable_event = convert_to_serializable(event_dict)
+
+        # Открываем файл в режиме дозаписи
+        with open(file_name, "a", encoding="utf-8") as f:
+            # Записываем объект как строку JSON
+            f.write(json.dumps(serializable_event, ensure_ascii=False, indent=4) + "\n")
+        logger.info(f"Event structure saved to {file_name}")
+
+    except Exception as e:
+        logger.error(f"Error while serializing event: {e}")
+        
+def normalize_chat_id(chat):
+    """
+    Преобразует идентификатор чата в формат с -100, если это супергруппа, форум или канал.
+
+    :param chat: Объект чата (например, из event.get_chat()).
+    :return: Преобразованный идентификатор чата в строковом формате.
+    """
+    if getattr(chat, "megagroup", False) or getattr(chat, "broadcast", False) or getattr(chat, "forum", False):
+        # Если ID уже имеет формат с -100, возвращаем его как есть
+        if str(chat.id).startswith("-100"):
+            return chat.id
+        # Добавляем -100 перед ID
+        return int(f"-100{abs(chat.id)}")
+    return chat.id
+    
+def is_monitored_chat(event_chat, event_topic, monitored_chats):
+    """
+    Проверяет, принадлежит ли событие отслеживаемому чату или топику.
+
+    :param event_chat: Чат события (объект чата).
+    :param event_topic: ID топика события (или None).
+    :param monitored_chats: Список фильтров чатов.
+    :return: True, если событие соответствует какому-либо фильтру, иначе False.
+    """
+    normalized_chat_id = str(normalize_chat_id(event_chat))
+    chat_title = getattr(event_chat, "title", None)
+    chat_username = getattr(event_chat, "username", None)
+
+    for chat_filter in monitored_chats:
+        # Проверяем ID чата
+        if "id" in chat_filter and str(chat_filter["id"]) != normalized_chat_id:
+            continue
+        
+        # Проверяем title чата
+        if "title" in chat_filter and chat_filter["title"] and chat_filter["title"] != chat_title:
+            continue
+        
+        # Проверяем username чата
+        if "username" in chat_filter and chat_filter["username"] and chat_filter["username"] != chat_username:
+            continue
+
+        # Проверяем топики
+        if "topics" in chat_filter and chat_filter["topics"]:
+            if event_topic not in chat_filter["topics"]:
+                continue
+
+        # Если всё совпало
+        return True
+
+    return False
+        
+async def listen_to_messages(client, monitored_chats, output_file="monitored_messages.json"):
+    """
+    Режим прослушивания сообщений из указанных чатов, включая топики форумов.
+
+    :param client: TelegramClient, авторизованный клиент.
+    :param monitored_chats: Список ID чатов или username, которые нужно мониторить.
+    :param output_file: Имя файла для записи новых сообщений.
+    """
+    console.print("[bold cyan]Listening to messages... Press Ctrl+C to stop.[/bold cyan]")
+    logger.info("Starting message listener...")
+
+    monitored_messages = []
+
+    @client.on(events.NewMessage())
+    async def new_message_handler(event):
+        try:
+            chat = await event.get_chat()
+            chat_name = getattr(chat, "title", None) or getattr(chat, "username", None) or "Private Chat/User"
+            
+            # Нормализуем идентификатор чата для проверки
+            normalized_chat_id = normalize_chat_id(chat)
+
+            # Логируем информацию о новом событии
+            logger.info(f"New event detected in chat {chat_name} (ID={normalized_chat_id}): Message ID={event.message.id}")
+            # logger.info(f"Normalized chat ID: {chat.id} ({type(chat.id)}), Monitored chats: {monitored_chats} ({[type(chat) for chat in monitored_chats]})")
+
+            # Проверяем, является ли сообщение из форума
+            forum_id = None
+            topic_id = None
+            if getattr(chat, "forum", False):  # Проверка, является ли чат форумом
+                forum_id = normalized_chat_id
+                topic_id = (
+                    getattr(event.message.reply_to, "reply_to_top_id", None)  # ID топика
+                    or getattr(event.message.reply_to, "reply_to_msg_id", None)  # Иногда используется как замена
+                )
+                
+                logger.info(f"Forum detected: Forum ID={forum_id}, Topic ID={topic_id}")
+
+            # Проверяем, принадлежит ли событие одному из отслеживаемых чатов
+            if not is_monitored_chat(chat, topic_id, monitored_chats):
+                return
+
+            # Логируем сообщение в консоль
+            console.print(f"[bold green]New message in chat {chat_name}:[/bold green] {event.message.message}")
+
+            # Если сообщение в топике форума, логируем ID топика
+            if topic_id:
+                logger.info(f"Message is in topic ID: {topic_id}")
+
+            # Сохраняем сообщение в список
+            monitored_messages.append({
+                "chat_id": normalized_chat_id,
+                "chat_name": chat_name,
+                "message_id": event.message.id,
+                "date": event.message.date.isoformat(),
+                "text": event.message.message,
+                "sender_id": event.message.sender_id,
+                "forum_id": forum_id,
+                "topic_id": topic_id,
+            })
+
+            # Периодически сохраняем сообщения в файл
+            if len(monitored_messages) % 10 == 0:
+                with open(output_file, "w", encoding="utf-8") as f:
+                    json.dump(monitored_messages, f, ensure_ascii=False, indent=4)
+                logger.info(f"Saved monitored messages to {output_file}")
+
+        except Exception as e:
+            logger.error(f"Error while handling new message: {e}")
+
+    try:
+        await client.run_until_disconnected()
+    except asyncio.exceptions.CancelledError:
+        # Обработка нажатия Ctrl+C
+        logger.info("Message listener stopped by user (Ctrl+C).")
+    except Exception as e:
+        logger.critical(f"Unexpected error in message listener: {e}")
+        raise
+        
 async def main():
-    # Выполняем асинхронную авторизацию
+    console.print("[bold magenta]Telegram Monitoring Tool[/bold magenta]")
+	# Выполняем асинхронную авторизацию
     client = await manual_authorization()
     if client is None:
         logger.critical("Authorization failed. Exiting...")
@@ -369,7 +535,8 @@ async def main():
         console.print("[1] Send a message")
         console.print("[2] Load and display chat list")
         console.print("[3] Fetch chat history")
-        console.print("[4] Exit")
+        console.print("[4] Listen to messages in chats")
+        console.print("[5] Exit")
         
         choice = input("Enter your choice: ").strip()
         
@@ -390,6 +557,59 @@ async def main():
             limit = None if not limit_input else int(limit_input)
             await fetch_chat_history(client, chat_id, output_file, topic_id, limit)
         elif choice == "4":
+            monitored_chats = []
+            console.print("[bold cyan]Add chats to monitor:[/bold cyan]")
+
+            while True:
+                chat_input = input("Enter chat ID, username, or title to monitor (leave blank to finish): ").strip()
+                if not chat_input:  # Выход из цикла при пустом вводе
+                    break
+
+                # Спрашиваем список топиков (если это форум)
+                topics_input = input("Enter topic IDs to monitor, separated by commas (optional): ").strip()
+                topics = [int(topic.strip()) for topic in topics_input.split(",") if topic.strip()] if topics_input else None
+
+                # Проверяем, это ID, username или title
+                if chat_input.isdigit() or chat_input.startswith("-"):
+                    # Введен ID
+                    monitored_chats.append({
+                        "id": int(chat_input),
+                        "username": None,
+                        "title": None,
+                        "topics": topics,
+                    })
+                    console.print(f"[bold green]Chat added to monitor by ID: {chat_input}, topics: {topics}[/bold green]")
+
+                elif chat_input.startswith("@"):
+                    # Введен username (должен начинаться с @)
+                    monitored_chats.append({
+                        "id": None,
+                        "username": chat_input.lstrip("@"),
+                        "title": None,
+                        "topics": topics,
+                    })
+                    console.print(f"[bold green]Chat added to monitor by username: {chat_input}, topics: {topics}[/bold green]")
+
+                else:
+                    # Иначе это предполагаемый заголовок (title)
+                    monitored_chats.append({
+                        "id": None,
+                        "username": None,
+                        "title": chat_input,
+                        "topics": topics,
+                    })
+                    console.print(f"[bold green]Chat added to monitor by title: {chat_input}, topics: {topics}[/bold green]")
+
+            console.print(f"[bold cyan]Final monitored chats list: {monitored_chats}[/bold cyan]")
+
+            # Если список пуст, предупреждаем
+            if not monitored_chats:
+                console.print("[bold yellow]No chats added for monitoring.[/bold yellow]")
+            else:
+                # Запускаем прослушивание сообщений
+                output_file = input("Enter the output file name for monitored messages (default: monitored_messages.json): ").strip() or "monitored_messages.json"
+                await listen_to_messages(client, monitored_chats, output_file)
+        elif choice == "5":
             console.print("[bold green]Exiting program. Goodbye![/bold green]")
             # Завершаем соединение
             await client.disconnect()
