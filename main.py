@@ -271,7 +271,7 @@ async def test_send_message(client, chat_id: str, message_text: str) -> bool:
     else:
         console.print("[bold yellow]Message sending failed.[/bold yellow]")
         
-async def fetch_chat_history(client, chat_id, output_file="chat_history.json", topic_id=None, limit=100):
+async def fetch_chat_history(client, chat_id, output_file="chat_history.json", topic_id=None, limit=None):
     """
     Скачивает историю сообщений из указанного чата или топика форума.
 
@@ -279,7 +279,7 @@ async def fetch_chat_history(client, chat_id, output_file="chat_history.json", t
     :param chat_id: ID чата или username.
     :param output_file: Имя файла для сохранения истории (по умолчанию "chat_history.json").
     :param topic_id: ID топика форума (если указан, загружаются сообщения только из этого топика).
-    :param limit: Максимальное количество сообщений для загрузки (по умолчанию 100).
+    :param limit: Максимальное количество сообщений для загрузки (по умолчанию None).
     """
     try:
         logger.info(f"Fetching history for chat ID {chat_id} with topic ID {topic_id}...")
@@ -292,19 +292,52 @@ async def fetch_chat_history(client, chat_id, output_file="chat_history.json", t
         entity = await client.get_entity(chat_id)
         logger.info(f"Entity fetched: {entity.title if hasattr(entity, 'title') else entity.id}")
 
-        # Настраиваем фильтр для топика
-        # filter_params = {"thread_id": topic_id} if topic_id else {}
-
         # Итерируем сообщения
         messages = []
-        async for message in client.iter_messages(entity, limit=limit, reply_to=topic_id):
-            messages.append({
-                "id": message.id,
-                "date": message.date.isoformat(),
-                "text": message.text or "",
-                "sender_id": message.sender_id,
-                "reply_to": message.reply_to.reply_to_msg_id if message.reply_to else None,
-            })
+        
+        offset_id = 0  # Начинаем с самого нового сообщения
+        remaining_limit = limit  # Начинаем с указанного лимита (или None)
+        
+        while True:
+            try:
+                
+                # Если лимит не задан, запрашиваем максимум 100 сообщений за раз
+                fetch_limit = 100 if remaining_limit is None else min(100, remaining_limit)
+                batch_messages = []  # Сообщения за текущую итерацию
+                
+                async for message in client.iter_messages(entity, limit=fetch_limit, offset_id=offset_id, reply_to=topic_id):
+                    batch_messages.append({
+                        "id": message.id,
+                        "date": message.date.isoformat(),
+                        "text": message.text or "",
+                        "sender_id": message.sender_id,
+                        "reply_to": message.reply_to.reply_to_msg_id if message.reply_to else None,
+                    })
+                    offset_id = message.id  # Устанавливаем новый offset_id
+
+                messages.extend(batch_messages)
+                if batch_messages:
+                    logger.info(f"Fetched {len(batch_messages)} messages. Total fetched: {len(messages)}. Last message ID: {offset_id}")
+
+                # Если сервер больше не возвращает сообщений, завершаем
+                if not batch_messages:
+                    break
+                    
+                # Уменьшаем лимит, если он задан
+                if remaining_limit is not None:
+                    remaining_limit -= len(messages)
+                    if remaining_limit <= 0:
+                        break
+                        
+                # Задержка между запросами
+                await asyncio.sleep(2)
+
+            except errors.FloodWaitError as e:
+                logger.warning(f"Rate limit exceeded. Waiting for {e.seconds} seconds...")
+                await asyncio.sleep(e.seconds)
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                raise  # Пробрасываем неиспользуемое исключение
 
         # Сохраняем историю сообщений в файл
         with open(output_file, "w", encoding="utf-8") as f:
@@ -353,7 +386,8 @@ async def main():
             topic_id_input = input("Enter the topic ID (optional, press Enter to skip): ").strip()
             topic_id = int(topic_id_input) if topic_id_input else None
             output_file = input("Enter the output file name (default: chat_history.json): ").strip() or "chat_history.json"
-            limit = int(input("Enter the number of messages to fetch (default: 100): ").strip() or 100)
+            limit_input = input("Enter the number of messages to fetch (default: None): ").strip()
+            limit = None if not limit_input else int(limit_input)
             await fetch_chat_history(client, chat_id, output_file, topic_id, limit)
         elif choice == "4":
             console.print("[bold green]Exiting program. Goodbye![/bold green]")
